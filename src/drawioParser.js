@@ -1,5 +1,7 @@
 import fs from 'fs'
 import { XMLParser, XMLBuilder, XMLValidator } from 'fast-xml-parser'
+import { logger } from './logger.js'
+import { split } from './utils.js'
 
 const STYLE_PARAM_DELIMETER = ';'
 const STYLE_VALUE_DELIMETER = '='
@@ -18,7 +20,14 @@ const ATTR = {
   EN: 'EN',
   SOURCE: 'source',
   TARGET: 'target',
-  COPY: TAG_PREFIX + 'копия'
+  COPY: TAG_PREFIX + 'копия',
+  NULLABLE: 'NULLABLE',
+  DATA_LENGTH: 'DATA_LENGTH',
+  DATA_PRECISION: 'DATA_PRECISION',
+  DATA_TYPE: 'DATA_TYPE',
+  REF: 'Ref',
+  REF_TO_CLASS: 'REF_TO_CLASS',
+  REF_TO_ATTRIBUTE: 'REF_TO_ATTRIBUTE'
 }
 
 const usefulAttr = new Set(Object.values(ATTR))
@@ -37,7 +46,7 @@ const getAttr = (value) => value.startsWith(ATTR_PREFIX) ? value.slice(ATTR_PREF
 const isUsefulAttr = (attr) => usefulAttr.has(attr)
 
 const parseObjects = (parsedXmlTree) => {
-  
+  const mxGraphModel = parsedXmlTree.mxfile.diagram.mxGraphModel  
   const parseTreeNode = (treeNode, acc) => {
     Object.entries(treeNode).forEach(([key, value]) => {
       const attr = getAttr(key)
@@ -50,6 +59,10 @@ const parseObjects = (parsedXmlTree) => {
       } else {
         if (isUsefulAttr(attr)) {
           acc[attr] = attr === ATTR.STYLE ? parseStyle(value) : value ? value.trim() : value
+        } else if (attr.toLocaleUpperCase() === attr) {
+          // для имен таблиц указанных в полях в объектах стрелочах
+          acc[ATTR.REF_TO_CLASS] = attr
+          acc[ATTR.REF_TO_ATTRIBUTE] = value ? value.trim() : value
         }
       }
     })
@@ -58,9 +71,9 @@ const parseObjects = (parsedXmlTree) => {
 
   const parseListOfTrees = (list) => list.map(item => parseTreeNode(item, {}))
     
-  let parsedCells = parseListOfTrees(parsedXmlTree.mxGraphModel.root.mxCell)
-  let parsedObjects = parseListOfTrees(parsedXmlTree.mxGraphModel.root.object)
-  let parsedUserObjects = parseListOfTrees(parsedXmlTree.mxGraphModel.root.UserObject)
+  let parsedCells = parseListOfTrees(mxGraphModel.root.mxCell)
+  let parsedObjects = parseListOfTrees(mxGraphModel.root.object)
+    .concat(parseListOfTrees(mxGraphModel.root.UserObject))
 
   // Ищем копии классов, запоминаем на что они ссылались и удаляем их
   const { filtered, originalId, usedIn } = parsedObjects.reduce((acc, item) => {
@@ -76,7 +89,7 @@ const parseObjects = (parsedXmlTree) => {
   parsedObjects = filtered;
 
   // Везде заменяем ссылки на копии ссылками на оригинальные классы, а также где использовалась копия (в каких группах\фичах)
-  [...parsedCells, ...parsedObjects, ...parsedUserObjects].forEach(item => {
+  [...parsedCells, ...parsedObjects].forEach(item => {
     [ATTR.PARENT, ATTR.SOURCE, ATTR.TARGET].forEach(key => {
       if (originalId[item[key]]) {
         item[key] = originalId[item[key]] || item[key]
@@ -87,19 +100,13 @@ const parseObjects = (parsedXmlTree) => {
     }
   })
 
-  const split = (list, func) => {
-    const { result, rest } = list.reduce((acc, item, index, array) => {
-      acc[func(item, index, array) ? 'result' : 'rest'].push(item)
-      return acc
-    }, { result: [], rest: [] })
-    return [result, rest]
-  }
-
   const [classes, _rest] = split(parsedObjects, (item) => item.tags === CLASS_TAG)
-  const [attributes, restObjects] = split(_rest, (item) => item.tags === ATTR_TAG)
+  let [attributes, restObjects] = split(_rest, (item) => item.tags === ATTR_TAG)
 
   if (restObjects.length > 0) {
-    console.error('При парсинге диаграммы остались неучтенные объекты. Но результат это может не повлиять, но следует сообщить об этом разработчику парсера (telegram @deniszhelnerovich)')
+    // logger.warning('При парсинге диаграммы остались неучтенные объекты, хотя на результат это может не повлиять:')
+    // logger.write(JSON.stringify(restObjects))
+    // logger.write('')
   }
 
   // Исключаем промежуточные связи между атрибутами и классами
@@ -108,7 +115,7 @@ const parseObjects = (parsedXmlTree) => {
   ), {})
   const allObjectsById = {
     ...classesById, 
-    ...[...parsedUserObjects, ...restObjects].reduce((acc, item) => (
+    ...[...attributes, ...restObjects].reduce((acc, item) => (
       acc[item[ATTR.ID]] = item, acc
     ), {})
   }
@@ -126,8 +133,6 @@ const parseObjects = (parsedXmlTree) => {
     }
   }
 
-
-  // const allObjectsById = { ...userObjectsById, ...objectsById }
   const allMediatorIds = new Set()
 
   attributes.forEach(item => {
@@ -140,28 +145,41 @@ const parseObjects = (parsedXmlTree) => {
     const classObject = classesById[item[ATTR.PARENT]]
     if (classObject) {
       classObject.attributes = (classObject.attributes || []).concat(item)
+      item.parentObject = classObject
     } else {
-      throw `Не найден класс на который ссылается атрибут ${item[ATTR.LABEL]}`
+      logger.error(`Не найден класс на который ссылается атрибут "${item[ATTR.LABEL]}"\n`)
     }
-
-    // const userObject = userObjectsById[item[ATTR.PARENT]]
-    // if (userObject) {
-    //   userObject[ATTR.PARENT]
-    // }
   })
 
-  parsedUserObjects = parsedUserObjects.filter(item => !allMediatorIds.has(item[ATTR.ID]))
+  restObjects = restObjects.filter(item => !allMediatorIds.has(item[ATTR.ID]))
 
-  // classes
+  const relations = [...parsedCells, ...restObjects].reduce((acc, { id, parent, source, target, style, ...rest }) => {
+    if (style) {
+      const endArrow = style.find(({ param }) => param === 'endArrow')?.value
+      const startArrow = style.find(({ param }) => param === 'startArrow')?.value
+      if (endArrow || startArrow) {
+        console.log(startArrow, endArrow)
+        acc.push({
+          source: { id: source, type: startArrow, object: allObjectsById[source] },
+          target: { id: target, type: endArrow, object: allObjectsById[target] },
+          refAttribute: rest[ATTR.REF],
+          refToClass: rest[ATTR.REF_TO_CLASS],
+          refToAttribute: rest[ATTR.REF_TO_ATTRIBUTE],
+        })
+      }
+    }
+    return acc
+  }, [])
 
-  // split(attributes, (item) => {
-  //   userObjectsById[item[ATTR.PARENT]]
-    
-  // })
-
-  //TODO: в атрибуты вставить связи
-
-  return classes
+  return {
+    relations,
+    classes: classes.filter(({ EN, label }) => {
+      if (!EN) {
+        logger.error(`Класс "${label}" не имеет идентификатора (свойство EN пустое), таблица не будет добавлена\n`)
+      }
+      return EN
+    })
+  }
 
 }
 

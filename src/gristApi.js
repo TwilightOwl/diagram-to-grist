@@ -1,8 +1,6 @@
 import fetch from 'node-fetch'
 import config from './config.json' assert { type: 'json' }
-
-// const loadJSON = (path) => JSON.parse(fs.readFileSync(new URL(path, import.meta.url)));
-// const countries = loadJSON('./data/countries.json');
+import { logger } from './logger.js'
 
 const BASE_URL = `https://docs.getgrist.com/api/docs/${config.grist.docId}/`
 
@@ -20,13 +18,28 @@ const request = (url, params = {}) => (
       } : {},
     }
   })
-  .then(response => {
-    return response.ok ? response.json() : Promise.reject(response)
+  .then(async (response) => {
+    if (response.ok) {
+      return response.json()
+    } else {
+      const error = await response.json()
+      logger.error(`Ошибка ${params.method || 'GET'} запроса ${BASE_URL + url}`)
+      if (params.body) {
+        logger.write(`Body: ${JSON.stringify(params.body)}`)
+      }
+      logger.write(`Response: ${error}\n`)
+      return Promise.reject(response)
+    }
   })
 )
 
 export const fetchTables = async () => {
-  return request('tables')
+  try {
+    const { tables } = await request('tables')
+    return tables
+  } catch(e) {
+    throw e
+  }
 }
 
 export const addTables = async (tables) => {
@@ -40,7 +53,12 @@ export const addTables = async (tables) => {
 }
 
 export const fetchColumns = async (tableId) => {
-  return request(`tables/${tableId}/columns`)
+  try {
+    const { columns } = await request(`tables/${tableId}/columns`)
+    return columns.filter(column => !column.id.startsWith('c'))
+  } catch(e) {
+    throw e
+  }
 }
 
 export const addColumns = async (tableId, columns) => {
@@ -48,6 +66,16 @@ export const addColumns = async (tableId, columns) => {
     `tables/${tableId}/columns`,
     {
       method: 'POST',
+      body: { columns }
+    }
+  )
+}
+
+export const updateColumns = async (tableId, columns) => {
+  return request(
+    `tables/${tableId}/columns`,
+    {
+      method: 'PATCH',
       body: { columns }
     }
   )
